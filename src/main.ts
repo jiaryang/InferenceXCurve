@@ -82,6 +82,7 @@ interface AppState {
   latencyPercentile: InferenceCurveLatencyPercentile;
   activeSeriesIds: Set<string>;
   activeSeriesIdsByView: Map<string, Set<string>>;
+  knownSeriesIdsByView: Map<string, Set<string>>;
   selectedPrecisions: Set<string>;
   modelFilter: string;
   scenarioFilter: string;
@@ -166,6 +167,7 @@ interface PersistedAppState {
   latencyPercentile?: InferenceCurveLatencyPercentile;
   activeSeriesIds?: string[];
   activeSeriesIdsByView?: Record<string, string[]>;
+  knownSeriesIdsByView?: Record<string, string[]>;
   selectedPrecisions?: string[];
   modelFilter?: string;
   scenarioFilter?: string;
@@ -789,6 +791,7 @@ function restorePersistedState(value: unknown): PersistedAppState {
     latencyPercentile: normalizeLatencyPercentile(value.latencyPercentile),
     activeSeriesIds: readPersistedStringArray(value.activeSeriesIds),
     activeSeriesIdsByView: readPersistedActiveSeriesByView(value.activeSeriesIdsByView),
+    knownSeriesIdsByView: readPersistedActiveSeriesByView(value.knownSeriesIdsByView),
     selectedPrecisions: readPersistedStringArray(value.selectedPrecisions),
     modelFilter: readPersistedText(value, 'modelFilter')
       ? getInferenceXDisplayModel(readPersistedText(value, 'modelFilter')) : undefined,
@@ -823,6 +826,11 @@ function restoreAppState(defaults: AppState, saved: PersistedAppState, series: I
       new Set(values.filter((id) => ids.has(id)))
     ])
   );
+  // Kept unfiltered: an id that has since disappeared still records that the
+  // view had seen it, and merged ids are derived so they never appear in `ids`.
+  const knownSeriesIdsByView = new Map(
+    Object.entries(saved.knownSeriesIdsByView ?? {}).map(([key, values]) => [key, new Set(values)])
+  );
   const precisionValues = new Set(getAvailablePrecisions(series));
   const selectedPrecisions = (saved.selectedPrecisions ?? []).filter((precision) =>
     precisionValues.has(precision)
@@ -840,6 +848,7 @@ function restoreAppState(defaults: AppState, saved: PersistedAppState, series: I
         ? new Set(activeSeriesIds)
         : new Set(defaults.activeSeriesIds),
     activeSeriesIdsByView,
+    knownSeriesIdsByView,
     selectedPrecisions:
       selectedPrecisions.length > 0 || precisionValues.size === 0
         ? new Set(selectedPrecisions)
@@ -876,7 +885,8 @@ function serializeAppState(): PersistedAppState {
     tcoCustomCosts: state.tcoCustomCosts,
     latencyPercentile: state.latencyPercentile,
     activeSeriesIds: Array.from(state.activeSeriesIds),
-    activeSeriesIdsByView: serializeActiveSeriesByView(),
+    activeSeriesIdsByView: serializeSeriesIdsByView(state.activeSeriesIdsByView),
+    knownSeriesIdsByView: serializeSeriesIdsByView(state.knownSeriesIdsByView),
     selectedPrecisions: Array.from(state.selectedPrecisions),
     modelFilter: state.modelFilter,
     scenarioFilter: state.scenarioFilter,
@@ -899,9 +909,9 @@ function serializeAppState(): PersistedAppState {
   };
 }
 
-function serializeActiveSeriesByView(): Record<string, string[]> {
+function serializeSeriesIdsByView(byView: Map<string, Set<string>>): Record<string, string[]> {
   const result: Record<string, string[]> = {};
-  state.activeSeriesIdsByView.forEach((ids, key) => {
+  byView.forEach((ids, key) => {
     result[key] = Array.from(ids);
   });
   return result;
@@ -5222,7 +5232,12 @@ function getCurrentViewSeriesIds(): Set<string> {
 function saveActiveSeriesForCurrentView(): void {
   const visibleIds = getCurrentViewSeriesIds();
   const activeIds = Array.from(state.activeSeriesIds).filter((id) => visibleIds.has(id));
-  state.activeSeriesIdsByView.set(getActiveSeriesViewKey(), new Set(activeIds));
+  const key = getActiveSeriesViewKey();
+  state.activeSeriesIdsByView.set(key, new Set(activeIds));
+  // Recording what the view could see, not just what was on, is what lets the
+  // next restore tell a line the user switched off from one that did not exist
+  // yet. Rewriting it wholesale also drops ids that have since disappeared.
+  state.knownSeriesIdsByView.set(key, new Set(visibleIds));
 }
 
 function restoreActiveSeriesForCurrentView(): void {
@@ -5235,11 +5250,19 @@ function restoreActiveSeriesForCurrentView(): void {
   const key = getActiveSeriesViewKey();
   const savedIds = state.activeSeriesIdsByView.get(key);
   if (savedIds) {
+    // Series this view has never seen are additions to the dataset rather than
+    // lines the user switched off, so they start visible. Saves written before
+    // the known set existed fall back to the active set, which turns every
+    // other visible line back on once and is then recorded accurately.
+    const known = state.knownSeriesIdsByView.get(key) ?? savedIds;
+    const restored = new Set([
+      ...Array.from(savedIds).filter((id) => visibleIds.has(id)),
+      ...Array.from(visibleIds).filter((id) => !known.has(id))
+    ]);
     // A saved view whose ids have all gone stale (reload drops merged ids,
     // which are derived rather than persisted) must not leave an empty chart.
-    const restored = Array.from(savedIds).filter((id) => visibleIds.has(id));
-    if (restored.length > 0) {
-      state.activeSeriesIds = new Set(restored);
+    if (restored.size > 0) {
+      state.activeSeriesIds = restored;
       return;
     }
   }
@@ -5324,6 +5347,7 @@ function createInitialState(series: InferenceCurveSeries[]): AppState {
     latencyPercentile: DEFAULT_LATENCY_PERCENTILE,
     activeSeriesIds: new Set(visibleSeries.map((line) => line.id)),
     activeSeriesIdsByView: new Map(),
+    knownSeriesIdsByView: new Map(),
     selectedPrecisions: firstPrecisionSelection(visibleSeries),
     modelFilter,
     scenarioFilter,
@@ -5356,6 +5380,7 @@ function setDefaultFiltersForSeries(series: InferenceCurveSeries[]): void {
   state.latencyPercentile = defaults.latencyPercentile;
   state.activeSeriesIds = defaults.activeSeriesIds;
   state.activeSeriesIdsByView = defaults.activeSeriesIdsByView;
+  state.knownSeriesIdsByView = defaults.knownSeriesIdsByView;
   state.selectedPrecisions = defaults.selectedPrecisions;
 }
 
