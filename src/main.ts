@@ -87,6 +87,7 @@ interface AppState {
   scenarioFilter: string;
   islOslFilter: string;
   mtpFilter: string;
+  mergeParallelism: boolean;
   enforceEndToEndPareto: boolean;
   showNonOptimalPoints: boolean;
   hidePointLabels: boolean;
@@ -170,6 +171,7 @@ interface PersistedAppState {
   scenarioFilter?: string;
   islOslFilter?: string;
   mtpFilter?: string;
+  mergeParallelism?: boolean;
   enforceEndToEndPareto?: boolean;
   showNonOptimalPoints?: boolean;
   hidePointLabels?: boolean;
@@ -793,6 +795,7 @@ function restorePersistedState(value: unknown): PersistedAppState {
     scenarioFilter: readPersistedText(value, 'scenarioFilter') || undefined,
     islOslFilter: readPersistedText(value, 'islOslFilter') || undefined,
     mtpFilter: readPersistedText(value, 'mtpFilter') || undefined,
+    mergeParallelism: readPersistedBoolean(value.mergeParallelism),
     enforceEndToEndPareto: readPersistedBoolean(value.enforceEndToEndPareto),
     showNonOptimalPoints: readPersistedBoolean(value.showNonOptimalPoints),
     hidePointLabels: readPersistedBoolean(value.hidePointLabels),
@@ -847,6 +850,7 @@ function restoreAppState(defaults: AppState, saved: PersistedAppState, series: I
       (saved.islOslFilter ? getScenarioForSequence(saved.islOslFilter) : defaults.scenarioFilter),
     islOslFilter: saved.islOslFilter ?? defaults.islOslFilter,
     mtpFilter: saved.mtpFilter ?? defaults.mtpFilter,
+    mergeParallelism: saved.mergeParallelism ?? defaults.mergeParallelism,
     enforceEndToEndPareto: saved.enforceEndToEndPareto ?? defaults.enforceEndToEndPareto,
     showNonOptimalPoints: saved.showNonOptimalPoints ?? defaults.showNonOptimalPoints,
     hidePointLabels: saved.hidePointLabels ?? defaults.hidePointLabels,
@@ -878,6 +882,7 @@ function serializeAppState(): PersistedAppState {
     scenarioFilter: state.scenarioFilter,
     islOslFilter: state.islOslFilter,
     mtpFilter: state.mtpFilter,
+    mergeParallelism: state.mergeParallelism,
     enforceEndToEndPareto: state.enforceEndToEndPareto,
     showNonOptimalPoints: state.showNonOptimalPoints,
     hidePointLabels: state.hidePointLabels,
@@ -3990,6 +3995,8 @@ function renderLegend(): void {
         }
         ${renderSwitch('logY', 'Log Scale', state.logY)}
         ${renderSwitch('showNonOptimalPoints', 'Optimal Only', !state.showNonOptimalPoints)}
+        ${renderSwitch('mergeParallelism', 'Merge Parallelism', state.mergeParallelism,
+          'Match the published InferenceX view: fold every parallelism config for the same hardware and framework into one curve, leaving TP/EP as point labels.')}
         ${renderSwitch('showGoalDirection', 'Better Direction', state.showGoalDirection)}
         ${
           state.scenarioFilter === AGENTIC_SCENARIO
@@ -4061,6 +4068,13 @@ function renderLegend(): void {
       const key = input.dataset.switch as keyof AppState;
       if (key === 'showNonOptimalPoints') {
         state.showNonOptimalPoints = !input.checked;
+      } else if (key === 'mergeParallelism') {
+        const previouslyActive = getFilteredSeriesForChart().filter((line) =>
+          state.activeSeriesIds.has(line.id)
+        );
+        saveActiveSeriesForCurrentView();
+        state.mergeParallelism = input.checked;
+        carryActiveSeriesAcrossGrouping(previouslyActive);
       } else if (key === 'showConcurrencyLabels') {
         state.showConcurrencyLabels = input.checked;
         if (input.checked) {
@@ -5187,7 +5201,16 @@ function activatePendingSeriesForCurrentView(): void {
 
 function getActiveSeriesViewKey(): string {
   const precisionKey = Array.from(state.selectedPrecisions).sort((a, b) => a.localeCompare(b)).join(',');
-  return [state.modelFilter, state.scenarioFilter, state.islOslFilter, state.mtpFilter, precisionKey]
+  // Merging rewrites series ids, so each grouping mode needs its own saved
+  // selection - otherwise switching modes restores ids that no longer exist.
+  return [
+    state.modelFilter,
+    state.scenarioFilter,
+    state.islOslFilter,
+    state.mtpFilter,
+    precisionKey,
+    state.mergeParallelism ? 'merged' : 'split'
+  ]
     .map((value) => encodeURIComponent(value || ''))
     .join('|');
 }
@@ -5212,8 +5235,13 @@ function restoreActiveSeriesForCurrentView(): void {
   const key = getActiveSeriesViewKey();
   const savedIds = state.activeSeriesIdsByView.get(key);
   if (savedIds) {
-    state.activeSeriesIds = new Set(Array.from(savedIds).filter((id) => visibleIds.has(id)));
-    return;
+    // A saved view whose ids have all gone stale (reload drops merged ids,
+    // which are derived rather than persisted) must not leave an empty chart.
+    const restored = Array.from(savedIds).filter((id) => visibleIds.has(id));
+    if (restored.length > 0) {
+      state.activeSeriesIds = new Set(restored);
+      return;
+    }
   }
 
   const currentIds = Array.from(state.activeSeriesIds).filter((id) => visibleIds.has(id));
@@ -5301,6 +5329,7 @@ function createInitialState(series: InferenceCurveSeries[]): AppState {
     scenarioFilter,
     islOslFilter,
     mtpFilter,
+    mergeParallelism: false,
     enforceEndToEndPareto: false,
     showNonOptimalPoints: false,
     hidePointLabels: true,
@@ -5386,9 +5415,104 @@ function getModelSequenceMtpFilteredSeries(): InferenceCurveSeries[] {
 }
 
 function getFilteredSeriesForChart(): InferenceCurveSeries[] {
-  return getModelSequenceMtpFilteredSeries().filter((series) =>
+  const filtered = getModelSequenceMtpFilteredSeries().filter((series) =>
     state.selectedPrecisions.has(getSeriesPrecision(series))
   );
+  return state.mergeParallelism ? mergeSeriesByParallelism(filtered) : filtered;
+}
+
+// InferenceX groups a published curve by hardware and framework alone, with
+// parallelism carried as point metadata, so one accelerator is one line and
+// TP8 / TEP4 only show up as point labels. The bundled series instead keep each
+// parallelism config on its own line so configs can be compared against each
+// other. Merging here reproduces the published shape without touching the data.
+function mergeSeriesByParallelism(series: InferenceCurveSeries[]): InferenceCurveSeries[] {
+  const groups = new Map<string, InferenceCurveSeries[]>();
+  series.forEach((line) => {
+    const key = getParallelismMergeKey(line);
+    const bucket = groups.get(key);
+    if (bucket) bucket.push(line);
+    else groups.set(key, [line]);
+  });
+
+  return Array.from(groups, ([key, members]) => {
+    if (members.length === 1) return members[0]!;
+    const ordered = [...members].sort(
+      (a, b) =>
+        (a.renderOrder ?? 0) - (b.renderOrder ?? 0) || seriesName(a).localeCompare(seriesName(b))
+    );
+    const lead = ordered[0]!;
+    return {
+      ...lead,
+      id: `merged|${key}`,
+      name: commonWordPrefix(ordered.map(seriesName)) || lead.name,
+      title: commonWordPrefix(ordered.map((line) => line.title ?? '')) || lead.title,
+      note: `Merged ${ordered.length} parallelism configs: ${ordered.map(seriesName).join(', ')}`,
+      points: ordered
+        .flatMap(seriesPoints)
+        .sort(
+          (a, b) =>
+            (a.interactivity ?? Number.POSITIVE_INFINITY) - (b.interactivity ?? Number.POSITIVE_INFINITY) ||
+            b.throughput - a.throughput ||
+            Number(a.concurrency ?? 0) - Number(b.concurrency ?? 0)
+        )
+    };
+  });
+}
+
+// Switching grouping mode rewrites series ids, so the selection cannot be
+// carried over by id. Merged lines reuse the exact point objects of their
+// members, which makes point identity a reliable bridge in both directions.
+function carryActiveSeriesAcrossGrouping(previouslyActive: InferenceCurveSeries[]): void {
+  const activePoints = new Set<InferenceCurveSeries['points'][number]>();
+  previouslyActive.forEach((line) => seriesPoints(line).forEach((point) => activePoints.add(point)));
+  const visible = getFilteredSeriesForChart();
+  const carried = visible.filter((line) => seriesPoints(line).some((point) => activePoints.has(point)));
+  state.activeSeriesIds = new Set((carried.length > 0 ? carried : visible).map((line) => line.id));
+  saveActiveSeriesForCurrentView();
+}
+
+// A trailing parallelism token such as `TP8/EP1`, `TEP4` or `DPA8`. Used only as
+// a fallback for series that carry no hardware key, so the grouping still works
+// on imported data while lines without such a token stay on their own.
+const PARALLELISM_NAME_SUFFIX = /\s+(?:DPA|DEP|TEP|PP|DP|TP|EP)\d+(?:\s*\/\s*(?:DPA|DEP|TEP|PP|DP|TP|EP)\d+)*$/iu;
+
+function getParallelismMergeKey(line: InferenceCurveSeries): string {
+  const scope = (suffix: string): string =>
+    [line.model, line.islOsl, line.precision, line.mtp, suffix]
+      .map((part) => encodeURIComponent(part ?? ''))
+      .join('|');
+
+  const hwKey = line.hwKey?.trim().toLowerCase();
+  if (hwKey) return `hw|${scope(hwKey)}`;
+
+  const name = seriesName(line).trim();
+  const base = name.replace(PARALLELISM_NAME_SUFFIX, '').trim();
+  // Only merge on names that actually ended in a parallelism token, otherwise
+  // unrelated imported lines would be folded together.
+  if (base && base !== name) return `name|${scope(base.toLowerCase())}`;
+  return `id|${encodeURIComponent(line.id)}`;
+}
+
+// Grouping runs during module init on series rehydrated from browser storage or
+// a CSV import, where the declared types are not actually enforced. A missing
+// name or point list must not throw: that would reject the `./main` import and
+// leave the workspace blank until storage is cleared by hand.
+function seriesName(line: InferenceCurveSeries): string {
+  return typeof line.name === 'string' ? line.name : '';
+}
+
+function seriesPoints(line: InferenceCurveSeries): InferenceCurveSeries['points'] {
+  return Array.isArray(line.points) ? line.points : [];
+}
+
+function commonWordPrefix(values: string[]): string {
+  const wordLists = values.map((value) => String(value ?? '').trim().split(/\s+/u).filter(Boolean));
+  const first = wordLists[0];
+  if (!first) return '';
+  let shared = 0;
+  while (shared < first.length && wordLists.every((words) => words[shared] === first[shared])) shared += 1;
+  return first.slice(0, shared).join(' ');
 }
 
 function shouldEnforceEndToEndPareto(): boolean {
