@@ -317,7 +317,11 @@ const DEFAULT_MODEL = 'Default Model';
 const DEFAULT_ISL_OSL = 'Default Scenario';
 const DEFAULT_PRECISION = 'default';
 const DEFAULT_LINE_STYLE = 'solid';
-const LOCAL_STORAGE_KEY = 'inferencex-curve:user-data:v1';
+// Bumped to v2 when the bundled defaults switched from DeepSeek-R1-0528 to the
+// GLM-5.2 agentic curves. Browsers holding a v1 payload (old series plus
+// DeepSeek sync configs that were still enabled) would otherwise keep
+// overriding the new defaults on every load.
+const LOCAL_STORAGE_KEY = 'inferencex-curve:user-data:v2';
 const TOKEN_STORAGE_KEY = 'inferencex-curve:github-token:v1';
 const LOCAL_SAVE_DEBOUNCE_MS = 350;
 const AUTO_RENDER_DEBOUNCE_MS = 400;
@@ -2253,6 +2257,16 @@ async function initializeInferenceXSync(): Promise<void> {
 }
 
 async function loadInitialInferenceXSyncData(): Promise<void> {
+  // With every sync config disabled the bundled `exampleSeries` is the intended
+  // chart, so skip the fetch rather than reporting "no matching rows".
+  if (!inferenceXSync.configs.some((config) => config.enabled)) {
+    inferenceXSync.status = 'idle';
+    inferenceXSync.lastError = '';
+    renderInferenceXSyncPanel();
+    setStatus('Showing bundled GLM-5.2 data; InferenceX sync is off by default');
+    return;
+  }
+
   inferenceXSync.status = 'checking';
   inferenceXSync.lastError = '';
   renderInferenceXSyncPanel();

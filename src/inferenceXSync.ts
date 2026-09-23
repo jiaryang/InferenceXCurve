@@ -127,6 +127,7 @@ const MODEL_DISPLAY_NAMES: Record<string, string> = {
   'minimaxm2.7': 'MiniMax-M2.5',
   glm5: 'GLM-5',
   'glm5.1': 'GLM-5',
+  'glm5.2': 'GLM-5.2',
   minimaxm3: 'MiniMax-M3',
   dsv4: 'DeepSeek-V4-Pro'
 };
@@ -136,15 +137,27 @@ const MODEL_API_PARAMS: Record<string, string> = {
   minimaxm3: 'MiniMax-M3'
 };
 
+// Defaults point at the GLM-5.2 agentic-trace curves for B200 and MI355X.
+//
+// These ship disabled: the bundled `exampleSeries` splits MI355X SGLang into
+// separate TP8/EP1 and TP4/EP4 curves, but sync groups only by
+// model / scenario / precision / hardware / framework — parallelism is point
+// metadata — so an enabled sync would merge those two curves back into one on
+// first open and destroy the config comparison. Enable a config from
+// `Manage Configs` when you want live API data instead of the bundled split.
+const DEFAULT_SYNC_TARGETS = [
+  { hardware: 'b200', framework: 'sglang' },
+  { hardware: 'mi355x', framework: 'sglang' },
+  { hardware: 'mi355x', framework: 'atom' }
+] as const;
+
 const DEFAULT_SYNC_CONFIG = {
-  model: 'DeepSeek-V4-Pro',
+  model: 'GLM-5.2',
   scenario: 'agentic-traces',
   isl: 0,
   osl: 0,
   precision: 'fp4',
-  hardware: 'mi355x',
-  framework: 'mori-sglang',
-  enabled: true
+  enabled: false
 } as const;
 
 type InferenceXBenchmarkRecord = Record<string, unknown>;
@@ -155,7 +168,9 @@ interface InferenceXDerivedAgenticMetrics {
 }
 
 export function createDefaultInferenceXSyncConfigs(): InferenceXSyncConfig[] {
-  return [normalizeInferenceXSyncConfig(DEFAULT_SYNC_CONFIG)];
+  return DEFAULT_SYNC_TARGETS.map((target) =>
+    normalizeInferenceXSyncConfig({ ...DEFAULT_SYNC_CONFIG, ...target })
+  );
 }
 
 export function normalizeInferenceXSyncConfigs(value: unknown): InferenceXSyncConfig[] {
