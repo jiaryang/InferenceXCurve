@@ -5764,7 +5764,9 @@ function createInitialState(series: InferenceCurveSeries[]): AppState {
     scenarioFilter,
     islOslFilter,
     mtpFilter,
-    mergeParallelism: false,
+    // Matches the published InferenceX chart, which keys a curve on hardware and
+    // framework and leaves parallelism as a point label.
+    mergeParallelism: true,
     enforceEndToEndPareto: false,
     showNonOptimalPoints: false,
     hidePointLabels: true,
