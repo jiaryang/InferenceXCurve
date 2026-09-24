@@ -351,6 +351,23 @@ const MAX_SNAPSHOTS = 20;
 const MAX_SNAPSHOT_NAME_LENGTH = 60;
 // Past versions of a synced line to keep before the oldest is dropped.
 const MAX_SYNC_ARCHIVES = 5;
+// Curves a view starts with. The bundled dataset carries several generations
+// of the same hardware, and showing all of them at once buries the comparison
+// they exist for: newest CI run for B200 and for MI355X SGLang, plus the
+// newest local MI355X sweep. Matching on hwKey rather than id keeps this
+// working under Merge Parallelism, where a merged curve inherits the hwKey but
+// gets a derived id. Declared up here because createInitialDataState reads it
+// during module init, long before the code that uses it further down.
+const DEFAULT_VISIBLE_HW_KEYS = new Set([
+  'b200_sglang',
+  'mi355x_sglang',
+  'mi355x_sglang_prs0923'
+]);
+// A trailing parallelism token such as `TP8/EP1`, `TEP4` or `DPA8`. Used only as
+// a fallback for series that carry no hardware key, so the grouping still works
+// on imported data while lines without such a token stay on their own. Up here
+// for the same reason as above: merging now runs during module init.
+const PARALLELISM_NAME_SUFFIX = /\s+(?:DPA|DEP|TEP|PP|DP|TP|EP)\d+(?:\s*\/\s*(?:DPA|DEP|TEP|PP|DP|TP|EP)\d+)*$/iu;
 const LOCAL_SAVE_DEBOUNCE_MS = 350;
 const AUTO_RENDER_DEBOUNCE_MS = 400;
 const MAX_WATERMARK_LENGTH = 64;
@@ -5702,18 +5719,6 @@ function saveActiveSeriesForCurrentView(): void {
   state.knownSeriesIdsByView.set(key, new Set(visibleIds));
 }
 
-// Curves a view starts with. The bundled dataset carries several generations
-// of the same hardware, and showing all of them at once buries the comparison
-// they exist for: newest CI run for B200 and for MI355X SGLang, plus the
-// newest local MI355X sweep. Matching on hwKey rather than id keeps this
-// working under Merge Parallelism, where a merged curve inherits the hwKey but
-// gets a derived id.
-const DEFAULT_VISIBLE_HW_KEYS = new Set([
-  'b200_sglang',
-  'mi355x_sglang',
-  'mi355x_sglang_prs0923'
-]);
-
 /** Falls back to everything, so imported datasets are not hidden by this. */
 function pickDefaultVisibleSeries(series: InferenceCurveSeries[]): InferenceCurveSeries[] {
   const preferred = series.filter((line) => DEFAULT_VISIBLE_HW_KEYS.has(line.hwKey ?? ''));
@@ -5986,11 +5991,6 @@ function carryActiveSeriesAcrossGrouping(previouslyActive: InferenceCurveSeries[
   state.activeSeriesIds = new Set((carried.length > 0 ? carried : visible).map((line) => line.id));
   saveActiveSeriesForCurrentView();
 }
-
-// A trailing parallelism token such as `TP8/EP1`, `TEP4` or `DPA8`. Used only as
-// a fallback for series that carry no hardware key, so the grouping still works
-// on imported data while lines without such a token stay on their own.
-const PARALLELISM_NAME_SUFFIX = /\s+(?:DPA|DEP|TEP|PP|DP|TP|EP)\d+(?:\s*\/\s*(?:DPA|DEP|TEP|PP|DP|TP|EP)\d+)*$/iu;
 
 function getParallelismMergeKey(line: InferenceCurveSeries): string {
   const scope = (suffix: string): string =>
