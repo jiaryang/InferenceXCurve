@@ -250,6 +250,13 @@ interface InitialDataState {
   loadedFromStorage: boolean;
 }
 
+interface StoredSnapshot {
+  id: string;
+  name: string;
+  savedAt: string;
+  data: PersistedAppData;
+}
+
 interface ColorPreset {
   name: string;
   value: string;
@@ -327,6 +334,14 @@ const DEFAULT_LINE_STYLE = 'solid';
 // overriding the new defaults on every load.
 const LOCAL_STORAGE_KEY = 'inferencex-curve:user-data:v2';
 const TOKEN_STORAGE_KEY = 'inferencex-curve:github-token:v1';
+// Snapshots live outside LOCAL_STORAGE_KEY so that Reset All, which wipes the
+// working data, leaves the saved history alone.
+const SNAPSHOT_STORAGE_KEY = 'inferencex-curve:snapshots:v1';
+const ACTIVE_SNAPSHOT_STORAGE_KEY = 'inferencex-curve:active-snapshot:v1';
+// Each snapshot is a full copy of the working data, so the 5 MB localStorage
+// budget is the real limit; this cap keeps us from silently walking into it.
+const MAX_SNAPSHOTS = 20;
+const MAX_SNAPSHOT_NAME_LENGTH = 60;
 const LOCAL_SAVE_DEBOUNCE_MS = 350;
 const AUTO_RENDER_DEBOUNCE_MS = 400;
 const MAX_WATERMARK_LENGTH = 64;
@@ -588,9 +603,10 @@ const fixedLengthChartMetrics = new Set<InferenceCurveXAxisMetric>([
   'endToEnd',
   'ttft'
 ]);
-function createInitialDataState(): InitialDataState {
+function createInitialDataState(
+  persisted: PersistedAppData | null = loadPersistedAppData()
+): InitialDataState {
   const defaultSeries = structuredClone(exampleSeries);
-  const persisted = loadPersistedAppData();
   if (!persisted) {
     return {
       currentSeries: defaultSeries,
@@ -631,21 +647,23 @@ function loadPersistedAppData(): PersistedAppData | null {
   try {
     const raw = window.localStorage.getItem(LOCAL_STORAGE_KEY);
     if (!raw) return null;
-    const data = JSON.parse(raw) as unknown;
-    if (!isRecord(data) || data.version !== 1) return null;
-
-    return {
-      version: 1,
-      savedAt: readPersistedText(data, 'savedAt'),
-      currentSeries: Array.isArray(data.currentSeries) ? readNativeSeries(data.currentSeries) : [],
-      seriesDrafts: restorePersistedSeriesDrafts(data.seriesDrafts),
-      state: restorePersistedState(data.state),
-      inferenceXSync: restorePersistedInferenceXSyncState(data.inferenceXSync)
-    };
+    return parsePersistedAppData(JSON.parse(raw));
   } catch (error) {
     console.warn('Could not load saved browser data.', error);
     return null;
   }
+}
+
+function parsePersistedAppData(data: unknown): PersistedAppData | null {
+  if (!isRecord(data) || data.version !== 1) return null;
+  return {
+    version: 1,
+    savedAt: readPersistedText(data, 'savedAt'),
+    currentSeries: Array.isArray(data.currentSeries) ? readNativeSeries(data.currentSeries) : [],
+    seriesDrafts: restorePersistedSeriesDrafts(data.seriesDrafts),
+    state: restorePersistedState(data.state),
+    inferenceXSync: restorePersistedInferenceXSyncState(data.inferenceXSync)
+  };
 }
 
 function createInferenceXSyncState(saved?: PersistedInferenceXSyncState): InferenceXSyncState {
@@ -954,6 +972,17 @@ function scheduleLocalSave(): void {
   }, LOCAL_SAVE_DEBOUNCE_MS);
 }
 
+function captureAppData(): PersistedAppData {
+  return {
+    version: 1,
+    savedAt: new Date().toISOString(),
+    currentSeries: getSeriesForPersistence(),
+    seriesDrafts,
+    state: serializeAppState(),
+    inferenceXSync: serializeInferenceXSyncState()
+  };
+}
+
 function saveLocalDataNow(): void {
   skipNextBeforeUnloadSave = false;
   if (localSaveTimer !== null) {
@@ -962,15 +991,7 @@ function saveLocalDataNow(): void {
   }
 
   try {
-    const payload: PersistedAppData = {
-      version: 1,
-      savedAt: new Date().toISOString(),
-      currentSeries: getSeriesForPersistence(),
-      seriesDrafts,
-      state: serializeAppState(),
-      inferenceXSync: serializeInferenceXSyncState()
-    };
-    window.localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(payload));
+    window.localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(captureAppData()));
     localStorageWarningShown = false;
   } catch (error) {
     if (!localStorageWarningShown) {
@@ -1022,6 +1043,90 @@ function resetStoredAppData(): void {
   } catch (error) {
     console.warn('Could not clear saved browser data.', error);
   }
+}
+
+function loadSnapshots(): StoredSnapshot[] {
+  try {
+    const raw = window.localStorage.getItem(SNAPSHOT_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.flatMap((entry) => {
+      if (!isRecord(entry)) return [];
+      const data = parsePersistedAppData(entry.data);
+      if (!data) return [];
+      const id = typeof entry.id === 'string' && entry.id ? entry.id : createSnapshotId();
+      const name = typeof entry.name === 'string' && entry.name.trim() ? entry.name.trim() : 'Untitled';
+      return [{ id, name, savedAt: readPersistedText(entry, 'savedAt'), data }];
+    });
+  } catch (error) {
+    console.warn('Could not load saved snapshots.', error);
+    return [];
+  }
+}
+
+/** Returns an error message, or '' when the write succeeded. */
+function writeSnapshots(list: StoredSnapshot[]): string {
+  try {
+    window.localStorage.setItem(SNAPSHOT_STORAGE_KEY, JSON.stringify(list));
+    return '';
+  } catch (error) {
+    console.warn('Could not save snapshots.', error);
+    // A full quota is the expected failure: every snapshot carries a complete
+    // copy of the chart data, so a handful of large datasets fills 5 MB.
+    return isQuotaExceeded(error)
+      ? 'Browser storage is full. Delete an older snapshot and try again.'
+      : 'Could not save the snapshot in this browser.';
+  }
+}
+
+function isQuotaExceeded(error: unknown): boolean {
+  return (
+    error instanceof DOMException &&
+    (error.name === 'QuotaExceededError' || error.name === 'NS_ERROR_DOM_QUOTA_REACHED')
+  );
+}
+
+function loadActiveSnapshotId(available: StoredSnapshot[]): string {
+  try {
+    const id = window.localStorage.getItem(ACTIVE_SNAPSHOT_STORAGE_KEY) ?? '';
+    return available.some((snapshot) => snapshot.id === id) ? id : '';
+  } catch {
+    return '';
+  }
+}
+
+function persistActiveSnapshotId(): void {
+  try {
+    if (activeSnapshotId) {
+      window.localStorage.setItem(ACTIVE_SNAPSHOT_STORAGE_KEY, activeSnapshotId);
+    } else {
+      window.localStorage.removeItem(ACTIVE_SNAPSHOT_STORAGE_KEY);
+    }
+  } catch (error) {
+    console.warn('Could not save the selected snapshot.', error);
+  }
+}
+
+function createSnapshotId(): string {
+  return `snap-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function formatSnapshotTimestamp(iso: string): string {
+  const parsed = new Date(iso);
+  if (Number.isNaN(parsed.getTime())) return '';
+  return parsed.toLocaleString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit'
+  });
+}
+
+function defaultSnapshotName(): string {
+  const count = currentSeries.length;
+  const stamp = formatSnapshotTimestamp(new Date().toISOString());
+  return `${stamp} - ${count} line${count === 1 ? '' : 's'}`;
 }
 
 function resetImportState(): void {
@@ -1114,6 +1219,11 @@ function readPersistedNumber(record: Record<string, unknown>, key: string, fallb
 const initialData = createInitialDataState();
 let currentSeries: InferenceCurveSeries[] = initialData.currentSeries;
 let seriesDrafts: SeriesDraft[] = initialData.seriesDrafts;
+let snapshots: StoredSnapshot[] = loadSnapshots();
+let activeSnapshotId = loadActiveSnapshotId(snapshots);
+// Signature of the working data as of the last snapshot save or load, so that
+// switching snapshots only interrupts with a confirm when work would be lost.
+let loadedSnapshotSignature = '';
 let pendingImportDrafts: PendingImportDraft[] = [];
 let pendingImportSettings: ImportBatchSettings = createImportBatchSettings();
 let pendingMergeGroups: PendingMergeGroup[] = [];
@@ -1288,6 +1398,38 @@ app.innerHTML = `
               multiple
               hidden
             />
+            <div class="data-action-group snapshot-group" aria-label="Snapshots">
+              <label class="snapshot-select-wrap">
+                ${renderIcon('history')}
+                <select id="snapshot-select" aria-label="Saved snapshots"></select>
+              </label>
+              <button
+                id="snapshot-save"
+                class="action-button has-help-tip"
+                type="button"
+                aria-label="Save the current data and settings as a snapshot"
+              >
+                ${renderIcon('save')}
+                <span>Save Snapshot</span>
+                <span class="help-tip-bubble" aria-hidden="true">
+                  <strong class="help-tip-title">Keep a named copy you can switch back to.</strong>
+                  <span class="help-tip-row">
+                    A snapshot stores every line plus the current filters, toggles and metric.
+                  </span>
+                  <span class="help-tip-note">
+                    Saved in this browser only, and kept when you press Reset All.
+                  </span>
+                </span>
+              </button>
+              <button id="snapshot-rename" class="action-button" type="button">
+                ${renderIcon('pencil')}
+                <span>Rename</span>
+              </button>
+              <button id="snapshot-delete" class="action-button danger" type="button">
+                ${renderIcon('trash')}
+                <span>Delete</span>
+              </button>
+            </div>
             <div class="data-action-group data-action-group-muted" aria-label="Data actions">
               <button id="reset-data" class="action-button" type="button">
                 ${renderIcon('refresh')}
@@ -1408,10 +1550,15 @@ const githubImportPreviewEl = document.querySelector<HTMLElement>('#github-impor
 const inferenceXSyncEl = document.querySelector<HTMLElement>('#inferencex-sync')!;
 const mergeLinesEl = document.querySelector<HTMLButtonElement>('#merge-lines')!;
 const mergePreviewEl = document.querySelector<HTMLElement>('#merge-preview')!;
+const snapshotSelectEl = document.querySelector<HTMLSelectElement>('#snapshot-select')!;
+const snapshotSaveEl = document.querySelector<HTMLButtonElement>('#snapshot-save')!;
+const snapshotRenameEl = document.querySelector<HTMLButtonElement>('#snapshot-rename')!;
+const snapshotDeleteEl = document.querySelector<HTMLButtonElement>('#snapshot-delete')!;
 
 renderFilterControls();
 renderInferenceXSyncPanel();
 renderSeriesEditor();
+renderSnapshotControls();
 renderAll();
 if (initialData.loadedFromStorage) {
   setStatus('Loaded saved browser data');
@@ -1439,9 +1586,170 @@ document.querySelector('#reset-data')?.addEventListener('click', () => {
   renderAll();
   resetImportState();
   resetStoredAppData();
+  loadedSnapshotSignature = '';
+  setActiveSnapshot('');
   setStatus('All settings and data restored to the default example');
   setImportStatus('');
   clearMergePreview();
+});
+
+function setActiveSnapshot(id: string): void {
+  activeSnapshotId = id;
+  persistActiveSnapshotId();
+  renderSnapshotControls();
+}
+
+function renderSnapshotControls(): void {
+  const atLimit = snapshots.length >= MAX_SNAPSHOTS;
+  const placeholder = snapshots.length === 0 ? 'No snapshots yet' : 'Working data';
+  snapshotSelectEl.innerHTML = [
+    `<option value="">${placeholder}</option>`,
+    ...snapshots.map((snapshot) => {
+      const stamp = formatSnapshotTimestamp(snapshot.savedAt);
+      const label = stamp ? `${snapshot.name} \u00b7 ${stamp}` : snapshot.name;
+      return `<option value="${escapeAttribute(snapshot.id)}">${escapeHtml(label)}</option>`;
+    })
+  ].join('');
+  snapshotSelectEl.value = activeSnapshotId;
+  snapshotSelectEl.disabled = snapshots.length === 0;
+  snapshotRenameEl.disabled = !activeSnapshotId;
+  snapshotDeleteEl.disabled = !activeSnapshotId;
+  snapshotSaveEl.disabled = atLimit;
+  snapshotSaveEl.title = atLimit
+    ? `Snapshot limit reached (${MAX_SNAPSHOTS}). Delete one first.`
+    : '';
+}
+
+/** Ignores savedAt so that two captures of untouched data compare equal. */
+function snapshotDataSignature(data: PersistedAppData): string {
+  const { savedAt: _savedAt, ...rest } = data;
+  return JSON.stringify(rest);
+}
+
+function findSnapshot(id: string): StoredSnapshot | undefined {
+  return snapshots.find((snapshot) => snapshot.id === id);
+}
+
+function readSnapshotName(promptText: string, fallback: string): string | null {
+  const entered = window.prompt(promptText, fallback);
+  if (entered === null) return null;
+  return entered.trim().slice(0, MAX_SNAPSHOT_NAME_LENGTH) || fallback;
+}
+
+function applySnapshot(snapshot: StoredSnapshot): void {
+  // structuredClone keeps later edits from mutating the stored copy in place.
+  const bundle = createInitialDataState(structuredClone(snapshot.data));
+  clearAutoRenderTimer();
+  currentSeries = bundle.currentSeries;
+  seriesDrafts = bundle.seriesDrafts;
+  state = bundle.state;
+  inferenceXSync = bundle.inferenceXSync;
+  syncWatermarkControl();
+  renderFilterControls();
+  renderInferenceXSyncPanel();
+  renderSeriesEditor();
+  renderAll();
+  resetImportState();
+  setImportStatus('');
+  clearMergePreview();
+
+  // Capture after rendering: the payload round-trips through the draft editor,
+  // so the restored data is not always byte-identical to what was stored.
+  loadedSnapshotSignature = snapshotDataSignature(captureAppData());
+  setActiveSnapshot(snapshot.id);
+  saveLocalDataNow();
+  setStatus(`Loaded snapshot "${snapshot.name}"`);
+}
+
+function workingDataIsUnsaved(): boolean {
+  return snapshotDataSignature(captureAppData()) !== loadedSnapshotSignature;
+}
+
+snapshotSelectEl.addEventListener('change', () => {
+  const id = snapshotSelectEl.value;
+  if (!id) {
+    setActiveSnapshot('');
+    return;
+  }
+  const snapshot = findSnapshot(id);
+  if (!snapshot) {
+    renderSnapshotControls();
+    return;
+  }
+  if (
+    workingDataIsUnsaved() &&
+    !window.confirm(
+      `Load snapshot "${snapshot.name}"? The current lines and settings will be replaced.`
+    )
+  ) {
+    snapshotSelectEl.value = activeSnapshotId;
+    return;
+  }
+  applySnapshot(snapshot);
+});
+
+snapshotSaveEl.addEventListener('click', () => {
+  if (snapshots.length >= MAX_SNAPSHOTS) {
+    setStatus(`Snapshot limit reached (${MAX_SNAPSHOTS}). Delete one first.`);
+    return;
+  }
+  const name = readSnapshotName('Snapshot name', defaultSnapshotName());
+  if (name === null) return;
+
+  const data = captureAppData();
+  const snapshot: StoredSnapshot = {
+    id: createSnapshotId(),
+    name,
+    savedAt: data.savedAt,
+    data
+  };
+  const next = [snapshot, ...snapshots];
+  const error = writeSnapshots(next);
+  if (error) {
+    setStatus(error);
+    return;
+  }
+  snapshots = next;
+  loadedSnapshotSignature = snapshotDataSignature(data);
+  setActiveSnapshot(snapshot.id);
+  setStatus(`Saved snapshot "${name}"`);
+});
+
+snapshotRenameEl.addEventListener('click', () => {
+  const snapshot = findSnapshot(activeSnapshotId);
+  if (!snapshot) return;
+  const name = readSnapshotName('Snapshot name', snapshot.name);
+  if (name === null || name === snapshot.name) return;
+
+  const next = snapshots.map((entry) =>
+    entry.id === snapshot.id ? { ...entry, name } : entry
+  );
+  const error = writeSnapshots(next);
+  if (error) {
+    setStatus(error);
+    return;
+  }
+  snapshots = next;
+  renderSnapshotControls();
+  setStatus(`Renamed snapshot to "${name}"`);
+});
+
+snapshotDeleteEl.addEventListener('click', () => {
+  const snapshot = findSnapshot(activeSnapshotId);
+  if (!snapshot) return;
+  if (!window.confirm(`Delete snapshot "${snapshot.name}"? The chart on screen stays as it is.`)) {
+    return;
+  }
+
+  const next = snapshots.filter((entry) => entry.id !== snapshot.id);
+  const error = writeSnapshots(next);
+  if (error) {
+    setStatus(error);
+    return;
+  }
+  snapshots = next;
+  setActiveSnapshot('');
+  setStatus(`Deleted snapshot "${snapshot.name}"`);
 });
 
 document.querySelector('#clear-data')?.addEventListener('click', () => {
@@ -3409,7 +3717,10 @@ function renderIcon(name: string): string {
     target: '<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="2"/><path d="M12 2v3"/><path d="M12 19v3"/><path d="M2 12h3"/><path d="M19 12h3"/>',
     help: '<circle cx="12" cy="12" r="9"/><path d="M9.5 9a2.5 2.5 0 0 1 4.5 1.5c0 1.7-2.5 2-2.5 3.5"/><path d="M12 17h.01"/>',
     sliders: '<path d="M4 7h16"/><path d="M4 17h16"/><circle cx="9" cy="7" r="2"/><circle cx="15" cy="17" r="2"/>',
-    upload: '<path d="M12 15V3"/><path d="m7 8 5-5 5 5"/><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>'
+    upload: '<path d="M12 15V3"/><path d="m7 8 5-5 5 5"/><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>',
+    save: '<path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><path d="M17 21v-8H7v8"/><path d="M7 3v5h8"/>',
+    history: '<path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 3v6h6"/><path d="M12 8v4l3 2"/>',
+    pencil: '<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>'
   };
   return `
     <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
