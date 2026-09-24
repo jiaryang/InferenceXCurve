@@ -72,6 +72,8 @@ export interface InferenceCurveChartOptions {
   useAdvancedLabels?: boolean;
   showGradientLabels?: boolean;
   showLineLabels?: boolean;
+  lineLabelOffsets?: Record<string, InferenceCurveLineLabelOffset>;
+  onLineLabelMove?: (seriesId: string, offset: InferenceCurveLineLabelOffset | null) => void;
   showOffloadRings?: boolean;
   highContrast?: boolean;
   logX?: boolean;
@@ -87,6 +89,19 @@ export interface InferenceCurveChartOptions {
   watermark?: string;
   xLabel?: string;
   yLabel?: string;
+}
+
+/**
+ * Where a dragged line label sits. `pointIndex` pins the leader to one point on
+ * the roofline so the anchor cannot drift when the automatic placement would
+ * have picked differently; dx/dy are pixels from that point. Pixels rather than
+ * data units because zooming rescales the axes and redraws, so a pixel offset
+ * keeps the label the same visual distance from its curve at any zoom.
+ */
+export interface InferenceCurveLineLabelOffset {
+  pointIndex: number;
+  dx: number;
+  dy: number;
 }
 
 export type ParetoGoal = 'maximize' | 'minimize';
@@ -212,7 +227,16 @@ interface PillLabel {
   y: number;
   label: string;
   color: string;
+  /** Point on the curve the label belongs to; drawn as a leader line. */
+  anchorX?: number;
+  anchorY?: number;
+  pointIndex?: number;
+  draggable?: boolean;
 }
+
+// d3.drag types the subject as `Datum | SubjectPosition` and .subject() does not
+// narrow it, so the alias has to carry the union.
+type PillDragBehavior = d3.DragBehavior<SVGGElement, PillLabel, PillLabel | d3.SubjectPosition>;
 
 type ContinuousScale = d3.ScaleLinear<number, number> | d3.ScaleLogarithmic<number, number>;
 type ShapeKey = 'circle' | 'square' | 'triangle' | 'diamond' | 'star' | 'plus' | 'cross';
@@ -381,6 +405,8 @@ const defaultOptions: Required<
   useAdvancedLabels: false,
   showGradientLabels: false,
   showLineLabels: false,
+  lineLabelOffsets: {},
+  onLineLabelMove: () => {},
   showOffloadRings: true,
   highContrast: false,
   logX: false,
@@ -1078,6 +1104,35 @@ export function renderInferenceCurveChart(
     applyInteraction();
   };
   let suppressNextSvgClick = false;
+  // Drag is attached once and reused across redraws: the label groups persist
+  // through the data join, so re-attaching on every zoom frame would be waste.
+  const lineLabelDrag = d3
+    .drag<SVGGElement, PillLabel>()
+    // The label itself is the subject; it already carries x/y, and without one
+    // the pill would jump to the cursor instead of keeping the grab point.
+    .subject((_event, label) => label)
+    .on('start', (event) => {
+      // Keep the gesture away from the chart's pan/zoom and from the click
+      // handler that clears the series selection.
+      event.sourceEvent?.stopPropagation();
+      suppressNextSvgClick = true;
+    })
+    .on('drag', function (event, label) {
+      label.x = event.x;
+      label.y = event.y;
+      d3.select(this)
+        .attr('transform', `translate(${label.x},${label.y})`)
+        .select<SVGLineElement>('.pill-leader')
+        .attr('x1', (label.anchorX ?? label.x) - label.x)
+        .attr('y1', (label.anchorY ?? label.y) - label.y);
+    })
+    .on('end', (_event, label) => {
+      options.onLineLabelMove(label.seriesId, {
+        pointIndex: label.pointIndex ?? 0,
+        dx: label.x - (label.anchorX ?? label.x),
+        dy: label.y - (label.anchorY ?? label.y)
+      });
+    });
   const clearHoverState = () => {
     if (!interaction.hoveredSeriesId && !interaction.hoveredPointKey) return;
     interaction.hoveredSeriesId = null;
@@ -1199,7 +1254,7 @@ export function renderInferenceCurveChart(
       setHoveredPoint
     );
     drawStrategyLabels(zoomGroup, visibleSeries, xs, ys, strategyColor, options);
-    drawLineLabels(zoomGroup, visibleSeries, xs, ys, options);
+    drawLineLabels(zoomGroup, visibleSeries, xs, ys, options, lineLabelDrag);
     applyInteraction();
   };
 
@@ -1593,12 +1648,16 @@ function drawStrategyLabels(
   drawPillJoin(zoomGroup, '.parallelism-label', labels, 'middle');
 }
 
+const LINE_LABEL_DEFAULT_DX = 8;
+const LINE_LABEL_DEFAULT_DY = -14;
+
 function drawLineLabels(
   zoomGroup: d3.Selection<SVGGElement, unknown, null, undefined>,
   series: PreparedSeries[],
   xScale: ContinuousScale,
   yScale: ContinuousScale,
-  options: Required<Omit<InferenceCurveChartOptions, 'activeSeriesIds' | 'selectedPrecisions'>>
+  options: Required<Omit<InferenceCurveChartOptions, 'activeSeriesIds' | 'selectedPrecisions'>>,
+  drag: PillDragBehavior | null
 ): void {
   if (!options.showLineLabels) {
     zoomGroup.selectAll('.line-label').remove();
@@ -1612,48 +1671,84 @@ function drawLineLabels(
     .sort((a, b) => yScale(a.roofline[0]!.y) - yScale(b.roofline[0]!.y));
 
   sorted.forEach((line) => {
+    const last = line.roofline.length - 1;
     const candidates = [
-      line.roofline[Math.min(1, line.roofline.length - 1)]!,
-      line.roofline[Math.floor(line.roofline.length / 2)]!,
-      line.roofline[Math.max(0, Math.floor((line.roofline.length * 2) / 3))]!,
-      line.roofline.at(-1)!
+      Math.min(1, last),
+      Math.floor(line.roofline.length / 2),
+      Math.max(0, Math.floor((line.roofline.length * 2) / 3)),
+      last
     ];
+    const moved = options.lineLabelOffsets[line.id];
 
-    const chosen =
-      candidates.find((point) => {
-        const px = xScale(point.x);
-        const py = yScale(point.y);
-        return !placed.some((label) => Math.abs(label.x - px) < 120 && Math.abs(label.y - py) < 18);
-      }) ?? candidates[0]!;
-    const px = xScale(chosen.x);
-    const py = yScale(chosen.y);
+    // A dragged label keeps the exact anchor it was dropped against. Re-running
+    // the automatic choice would let the anchor jump whenever another label
+    // moves, dragging the leader line with it.
+    const pointIndex = moved
+      ? Math.min(Math.max(moved.pointIndex, 0), last)
+      : candidates.find((index) => {
+          const px = xScale(line.roofline[index]!.x);
+          const py = yScale(line.roofline[index]!.y);
+          return !placed.some((label) => Math.abs(label.x - px) < 120 && Math.abs(label.y - py) < 18);
+        }) ?? candidates[0]!;
+
+    const px = xScale(line.roofline[pointIndex]!.x);
+    const py = yScale(line.roofline[pointIndex]!.y);
     placed.push({ x: px, y: py });
-    labels.push({ key: line.id, seriesId: line.id, x: px + 8, y: py - 14, label: line.name, color: line.color });
+    labels.push({
+      key: line.id,
+      seriesId: line.id,
+      x: px + (moved?.dx ?? LINE_LABEL_DEFAULT_DX),
+      y: py + (moved?.dy ?? LINE_LABEL_DEFAULT_DY),
+      anchorX: px,
+      anchorY: py,
+      pointIndex,
+      draggable: true,
+      label: line.name,
+      color: line.color
+    });
   });
 
-  drawPillJoin(zoomGroup, '.line-label', labels, 'start');
+  drawPillJoin(zoomGroup, '.line-label', labels, 'start', drag, (label) =>
+    options.onLineLabelMove(label.seriesId, null)
+  );
 }
 
 function drawPillJoin(
   layer: d3.Selection<SVGGElement, unknown, null, undefined>,
   selector: string,
   labels: PillLabel[],
-  anchor: 'start' | 'middle'
+  anchor: 'start' | 'middle',
+  drag: PillDragBehavior | null = null,
+  onReset: ((label: PillLabel) => void) | null = null
 ): void {
   const groups = layer
     .selectAll<SVGGElement, (typeof labels)[number]>(selector)
     .data(labels, (label) => label.key)
     .join(
       (enter) => {
-        const group = enter.append('g').attr('class', selector.slice(1)).style('pointer-events', 'none');
+        const group = enter.append('g').attr('class', selector.slice(1));
+        // Leader first so the pill paints over the end of it, which makes the
+        // line stop cleanly at whichever edge it enters.
+        group.append('line').attr('class', 'pill-leader');
         group.append('rect').attr('class', 'pill-bg').attr('rx', 4).attr('ry', 4);
         group.append('text').attr('class', 'pill-text').attr('dominant-baseline', 'central');
+        if (drag) group.call(drag);
+        if (onReset) {
+          group.on('dblclick', (event: MouseEvent, label) => {
+            // Otherwise the chart's own dblclick would also reset the zoom.
+            event.stopPropagation();
+            event.preventDefault();
+            onReset(label);
+          });
+        }
         return group;
       },
       (update) => update,
       (exit) => exit.remove()
     )
-    .attr('transform', (label) => `translate(${label.x},${label.y})`);
+    .attr('transform', (label) => `translate(${label.x},${label.y})`)
+    .style('pointer-events', (label) => (label.draggable ? 'auto' : 'none'))
+    .style('cursor', (label) => (label.draggable ? 'move' : null));
 
   const texts = groups
     .select<SVGTextElement>('.pill-text')
@@ -1672,7 +1767,30 @@ function drawPillJoin(
       .attr('width', bbox.width + 10)
       .attr('height', bbox.height + 6)
       .attr('fill', label.color);
+    updatePillLeader(group, label, bbox);
   });
+}
+
+function updatePillLeader(
+  group: d3.Selection<SVGGElement, unknown, null, undefined>,
+  label: PillLabel,
+  bbox: DOMRect
+): void {
+  const leader = group.select<SVGLineElement>('.pill-leader');
+  if (label.anchorX === undefined || label.anchorY === undefined) {
+    leader.attr('display', 'none');
+    return;
+  }
+  leader
+    .attr('display', null)
+    .attr('x1', label.anchorX - label.x)
+    .attr('y1', label.anchorY - label.y)
+    // Aim at the pill's centre rather than an edge: the opaque pill is painted
+    // on top, so the visible line ends wherever it meets the pill from.
+    .attr('x2', bbox.x + bbox.width / 2)
+    .attr('y2', bbox.y + bbox.height / 2)
+    .attr('stroke', label.color)
+    .attr('stroke-width', 1.5);
 }
 
 function applySeriesInteraction(

@@ -923,6 +923,12 @@ p {
   opacity: 0.9;
 }
 
+.pill-leader {
+  opacity: 0.8;
+  /* Only the pill is a drag handle; the thin leader would be a fiddly target. */
+  pointer-events: none;
+}
+
 .chart-tooltip {
   position: absolute;
   z-index: 50;

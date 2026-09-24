@@ -51,6 +51,7 @@ import {
   type InferenceCurveE2ENormalizedInteractivityPercentiles,
   type InferenceCurveLatencyPercentile,
   type InferenceCurveLatencyPercentiles,
+  type InferenceCurveLineLabelOffset,
   type InferenceCurveSeries,
   type InferenceCurveXAxisMetric,
   type InferenceCurveYAxisMetric,
@@ -98,6 +99,7 @@ interface AppState {
   useAdvancedLabels: boolean;
   showGradientLabels: boolean;
   showLineLabels: boolean;
+  lineLabelOffsets: Record<string, InferenceCurveLineLabelOffset>;
   showGoalDirection: boolean;
   showOffloadRings: boolean;
   highContrast: boolean;
@@ -183,6 +185,7 @@ interface PersistedAppState {
   useAdvancedLabels?: boolean;
   showGradientLabels?: boolean;
   showLineLabels?: boolean;
+  lineLabelOffsets?: Record<string, InferenceCurveLineLabelOffset>;
   showGoalDirection?: boolean;
   showOffloadRings?: boolean;
   highContrast?: boolean;
@@ -832,6 +835,7 @@ function restorePersistedState(value: unknown): PersistedAppState {
     useAdvancedLabels: readPersistedBoolean(value.useAdvancedLabels),
     showGradientLabels: readPersistedBoolean(value.showGradientLabels),
     showLineLabels: readPersistedBoolean(value.showLineLabels),
+    lineLabelOffsets: readPersistedLineLabelOffsets(value.lineLabelOffsets),
     showGoalDirection: readPersistedBoolean(value.showGoalDirection),
     showOffloadRings: readPersistedBoolean(value.showOffloadRings),
     highContrast: readPersistedBoolean(value.highContrast),
@@ -893,6 +897,7 @@ function restoreAppState(defaults: AppState, saved: PersistedAppState, series: I
     useAdvancedLabels: saved.useAdvancedLabels ?? defaults.useAdvancedLabels,
     showGradientLabels: saved.showGradientLabels ?? defaults.showGradientLabels,
     showLineLabels: saved.showLineLabels ?? defaults.showLineLabels,
+    lineLabelOffsets: saved.lineLabelOffsets ?? defaults.lineLabelOffsets,
     showGoalDirection: saved.showGoalDirection ?? defaults.showGoalDirection,
     showOffloadRings: saved.showOffloadRings ?? defaults.showOffloadRings,
     highContrast: saved.highContrast ?? defaults.highContrast,
@@ -926,6 +931,7 @@ function serializeAppState(): PersistedAppState {
     useAdvancedLabels: state.useAdvancedLabels,
     showGradientLabels: state.showGradientLabels,
     showLineLabels: state.showLineLabels,
+    lineLabelOffsets: state.lineLabelOffsets,
     showGoalDirection: state.showGoalDirection,
     showOffloadRings: state.showOffloadRings,
     highContrast: state.highContrast,
@@ -1213,6 +1219,29 @@ function readPersistedInferenceXSyncStatus(value: unknown): InferenceXSyncStatus
 
 function readPersistedBoolean(value: unknown): boolean | undefined {
   return typeof value === 'boolean' ? value : undefined;
+}
+
+function readPersistedLineLabelOffsets(
+  value: unknown
+): Record<string, InferenceCurveLineLabelOffset> | undefined {
+  if (!isRecord(value)) return undefined;
+  const offsets: Record<string, InferenceCurveLineLabelOffset> = {};
+  Object.entries(value).forEach(([seriesId, entry]) => {
+    if (!isRecord(entry)) return;
+    const { pointIndex, dx, dy } = entry;
+    if (
+      typeof pointIndex !== 'number' ||
+      !Number.isFinite(pointIndex) ||
+      typeof dx !== 'number' ||
+      !Number.isFinite(dx) ||
+      typeof dy !== 'number' ||
+      !Number.isFinite(dy)
+    ) {
+      return;
+    }
+    offsets[seriesId] = { pointIndex, dx, dy };
+  });
+  return offsets;
 }
 
 function readPersistedNumber(record: Record<string, unknown>, key: string, fallback: number): number {
@@ -2144,6 +2173,8 @@ function getChartOptions(): InferenceCurveChartOptions {
     useAdvancedLabels: state.useAdvancedLabels,
     showGradientLabels: state.showGradientLabels,
     showLineLabels: state.showLineLabels,
+    lineLabelOffsets: state.lineLabelOffsets,
+    onLineLabelMove: handleLineLabelMove,
     showGoalIndicators: state.showGoalDirection,
     showOffloadRings: state.showOffloadRings,
     highContrast: state.highContrast,
@@ -2154,6 +2185,25 @@ function getChartOptions(): InferenceCurveChartOptions {
     watermark: state.watermark,
     xLabel: getInferenceCurveXAxisLabel(state.chartMetric, undefined, latencyPercentile)
   };
+}
+
+function handleLineLabelMove(
+  seriesId: string,
+  offset: InferenceCurveLineLabelOffset | null
+): void {
+  if (offset) {
+    state.lineLabelOffsets = { ...state.lineLabelOffsets, [seriesId]: offset };
+    // The chart already moved the label as the pointer went; re-rendering here
+    // would only redraw it where it already is.
+    scheduleLocalSave();
+    return;
+  }
+  if (!(seriesId in state.lineLabelOffsets)) return;
+  const { [seriesId]: _removed, ...rest } = state.lineLabelOffsets;
+  state.lineLabelOffsets = rest;
+  // Resetting does need a redraw: automatic placement has to run again.
+  renderAll();
+  scheduleLocalSave();
 }
 
 function renderAll(): void {
@@ -4436,7 +4486,8 @@ function renderLegend(): void {
           'DCP: P = Prefill, D = Decode, ? = not provided. Disaggregated labels list Prefill then Decode.')}
         ${renderSwitch('showGradientLabels', 'Gradient Labels', state.showGradientLabels,
           'Color and label strategies including phase DCP: P = Prefill, D = Decode, ? = not provided.')}
-        ${renderSwitch('showLineLabels', 'Line Labels', state.showLineLabels)}
+        ${renderSwitch('showLineLabels', 'Line Labels', state.showLineLabels,
+          'Name each curve on the plot. Drag a label to move it out of the way; a leader line keeps it tied to its curve. Double-click a label to put it back.')}
         ${renderSwitch('showOffloadRings', 'Offload Rings', state.showOffloadRings)}
       </div>
     </div>
@@ -5774,6 +5825,7 @@ function createInitialState(series: InferenceCurveSeries[]): AppState {
     useAdvancedLabels: false,
     showGradientLabels: false,
     showLineLabels: false,
+    lineLabelOffsets: {},
     showGoalDirection: true,
     showOffloadRings: true,
     highContrast: false,
