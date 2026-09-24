@@ -20,7 +20,9 @@ import {
   formatInferenceXConfigLabel,
   getInferenceXDisplayModel,
   inferenceXAvailabilityRowMatchesConfig,
+  latestPointDate,
   makeInferenceXSyncLineId,
+  prefixCurveName,
   normalizeInferenceXSyncConfig,
   normalizeInferenceXSyncConfigs,
   type InferenceXAvailabilityRow,
@@ -208,6 +210,7 @@ interface PersistedInferenceXSyncState {
   status?: InferenceXSyncStatus;
   availableUpdateCount?: number;
   lastError?: string;
+  keepHistory?: boolean;
 }
 
 interface InferenceXSyncState {
@@ -219,6 +222,7 @@ interface InferenceXSyncState {
   status: InferenceXSyncStatus;
   availableUpdateCount: number;
   lastError: string;
+  keepHistory: boolean;
   stagedResult: InferenceXSyncResult | null;
   changedConfigIds: Set<string>;
   missingConfigIds: Set<string>;
@@ -342,6 +346,8 @@ const ACTIVE_SNAPSHOT_STORAGE_KEY = 'inferencex-curve:active-snapshot:v1';
 // budget is the real limit; this cap keeps us from silently walking into it.
 const MAX_SNAPSHOTS = 20;
 const MAX_SNAPSHOT_NAME_LENGTH = 60;
+// Past versions of a synced line to keep before the oldest is dropped.
+const MAX_SYNC_ARCHIVES = 5;
 const LOCAL_SAVE_DEBOUNCE_MS = 350;
 const AUTO_RENDER_DEBOUNCE_MS = 400;
 const MAX_WATERMARK_LENGTH = 64;
@@ -679,6 +685,7 @@ function createInferenceXSyncState(saved?: PersistedInferenceXSyncState): Infere
     status: restoredStatus,
     availableUpdateCount: restoredStatus === 'idle' ? 0 : (saved?.availableUpdateCount ?? 0),
     lastError: saved?.lastError ?? '',
+    keepHistory: saved?.keepHistory ?? true,
     stagedResult: null,
     changedConfigIds: new Set(),
     missingConfigIds: new Set(),
@@ -704,7 +711,8 @@ function restorePersistedInferenceXSyncState(value: unknown): PersistedInference
     lastUpdatedAt: readPersistedText(value, 'lastUpdatedAt'),
     status: readPersistedInferenceXSyncStatus(value.status),
     availableUpdateCount: readPersistedNumber(value, 'availableUpdateCount', 0),
-    lastError: readPersistedText(value, 'lastError')
+    lastError: readPersistedText(value, 'lastError'),
+    keepHistory: typeof value.keepHistory === 'boolean' ? value.keepHistory : undefined
   };
 }
 
@@ -942,6 +950,7 @@ function serializeInferenceXSyncState(): PersistedInferenceXSyncState {
     lineIdsByConfigKey: inferenceXSync.lineIdsByConfigKey,
     lastCheckedAt: inferenceXSync.lastCheckedAt,
     lastUpdatedAt: inferenceXSync.lastUpdatedAt,
+    keepHistory: inferenceXSync.keepHistory,
     status:
       inferenceXSync.status === 'checking' ||
       inferenceXSync.status === 'updating' ||
@@ -2168,6 +2177,10 @@ function renderInferenceXSyncPanel(): void {
         <span>${enabledCount}/${inferenceXSync.configs.length} configs enabled</span>
       </div>
       <div class="inferencex-sync-actions">
+        <label class="inferencex-sync-keep" title="Keep the outgoing version of every changed line, named by its benchmark date, so refreshes can be compared instead of overwriting each other.">
+          <input type="checkbox" data-sync-action="keep-history" ${inferenceXSync.keepHistory ? 'checked' : ''} />
+          <span>Keep History</span>
+        </label>
         <button
           type="button"
           class="series-action-button"
@@ -2552,6 +2565,12 @@ function handleInferenceXSyncClick(event: MouseEvent): void {
 
 function handleInferenceXSyncChange(event: Event): void {
   const input = event.target as HTMLInputElement | HTMLSelectElement;
+  if (input.dataset.syncAction === 'keep-history' && input instanceof HTMLInputElement) {
+    inferenceXSync.keepHistory = input.checked;
+    scheduleLocalSave();
+    return;
+  }
+
   const configIndex = Number(input.dataset.syncConfigIndex);
   const configField = input.dataset.syncConfigField;
   if (Number.isInteger(configIndex) && configField === 'enabled') {
@@ -2695,6 +2714,7 @@ function applyInferenceXSyncResult(result: InferenceXSyncResult, options: { init
   });
   const changedLineIds = new Set(getInferenceXChangedSummaryItems().map((item) => item.lineId));
   const collapsedById = new Map(seriesDrafts.map((draft) => [draft.id, draft.collapsed]));
+  const archivedLineIds = new Set<string>();
 
   if (options.initial) {
     currentSeries = result.series.map((line, index) => ({ ...line, renderOrder: result.series.length - index - 1 }));
@@ -2715,8 +2735,15 @@ function applyInferenceXSyncResult(result: InferenceXSyncResult, options: { init
       nextRenderOrder -= 1;
       return { ...styled, renderOrder: nextRenderOrder };
     });
+    const archived = inferenceXSync.keepHistory
+      ? archiveReplacedSyncLines(styledSyncSeries, changedLineIds, existingLineById, legacyLineIdsByLineId)
+      : [];
+    archived.forEach((line) => archivedLineIds.add(line.id));
     currentSeries = [
-      ...existingSeries.filter((line) => !replacedSyncLineIds.has(line.id)),
+      ...pruneSyncArchives([
+        ...existingSeries.filter((line) => !replacedSyncLineIds.has(line.id)),
+        ...archived
+      ]),
       ...styledSyncSeries
     ];
     seriesDrafts = seriesToDrafts(currentSeries);
@@ -2746,6 +2773,9 @@ function applyInferenceXSyncResult(result: InferenceXSyncResult, options: { init
   syncCurrentSeriesOrderFromDrafts();
   reconcileFiltersForSeries(currentSeries);
   reconcileActiveSeriesForChart();
+  // Archives exist to be compared on demand. Adding every past version to the
+  // chart on each refresh would crowd out the lines the update was about.
+  archivedLineIds.forEach((id) => state.activeSeriesIds.delete(id));
   saveActiveSeriesForCurrentView();
   renderFilterControls();
   renderInferenceXSyncPanel();
@@ -2753,6 +2783,76 @@ function applyInferenceXSyncResult(result: InferenceXSyncResult, options: { init
   renderAll();
   clearMergePreview();
   scheduleLocalSave();
+  if (archivedLineIds.size > 0) {
+    setStatus(
+      `Kept ${archivedLineIds.size} previous line version${archivedLineIds.size === 1 ? '' : 's'} for comparison. Turn them on in the legend.`
+    );
+  }
+}
+
+const SYNC_ARCHIVE_SEPARATOR = '::archived-';
+
+/**
+ * Keeps the outgoing version of every line the refresh actually changed, so a
+ * sync becomes a comparison instead of an overwrite.
+ */
+function archiveReplacedSyncLines(
+  incoming: InferenceCurveSeries[],
+  changedLineIds: Set<string>,
+  existingLineById: Map<string, InferenceCurveSeries>,
+  legacyLineIdsByLineId: Map<string, string[]>
+): InferenceCurveSeries[] {
+  const archives: InferenceCurveSeries[] = [];
+  incoming.forEach((line) => {
+    if (!changedLineIds.has(line.id)) return;
+    const candidateIds = [line.id, ...(legacyLineIdsByLineId.get(line.id) ?? [])];
+    const previous = candidateIds.map((id) => existingLineById.get(id)).find(Boolean);
+    if (!previous || isSyncArchiveLine(previous)) return;
+
+    const stamp = latestPointDate(previous) || new Date().toISOString().slice(0, 10);
+    const id = `${previous.id}${SYNC_ARCHIVE_SEPARATOR}${stamp}`;
+    if (existingLineById.has(id)) return;
+
+    archives.push({
+      ...previous,
+      id,
+      // Lines synced before this feature have no date in their name; give them
+      // one now so the archive is still identifiable.
+      name: hasCurveNamePrefix(previous.name) ? previous.name : prefixCurveName(stamp, 'CI', previous.name),
+      // A distinct hwKey keeps Merge Parallelism from folding an archive back
+      // into the live line, which would erase the difference being compared.
+      hwKey: previous.hwKey ? `${previous.hwKey}${SYNC_ARCHIVE_SEPARATOR}${stamp}` : undefined,
+      lineStyle: 'dotted',
+      note: `Previous version kept on ${formatDateTimeShort(new Date().toISOString())}. ${previous.note ?? ''}`.trim(),
+      renderOrder: (previous.renderOrder ?? 0) - 0.5
+    });
+  });
+  return archives;
+}
+
+/** Drops the oldest archives once a line has more than MAX_SYNC_ARCHIVES kept. */
+function pruneSyncArchives(lines: InferenceCurveSeries[]): InferenceCurveSeries[] {
+  const keptByBase = new Map<string, number>();
+  const dropped = new Set<string>();
+  // Newest stamp first, so the survivors are the most recent versions.
+  [...lines]
+    .filter(isSyncArchiveLine)
+    .sort((a, b) => b.id.localeCompare(a.id))
+    .forEach((line) => {
+      const base = line.id.split(SYNC_ARCHIVE_SEPARATOR)[0] ?? line.id;
+      const kept = keptByBase.get(base) ?? 0;
+      if (kept >= MAX_SYNC_ARCHIVES) dropped.add(line.id);
+      else keptByBase.set(base, kept + 1);
+    });
+  return dropped.size === 0 ? lines : lines.filter((line) => !dropped.has(line.id));
+}
+
+function isSyncArchiveLine(line: InferenceCurveSeries): boolean {
+  return line.id.includes(SYNC_ARCHIVE_SEPARATOR);
+}
+
+function hasCurveNamePrefix(name: string | undefined): boolean {
+  return /^\d{2}-\d{2}-(?:CI|local)-/u.test(name ?? '');
 }
 
 function applyExistingSyncLineStyle(

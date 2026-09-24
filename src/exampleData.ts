@@ -6,12 +6,16 @@ import type { InferenceCurveSeries } from './inferenceCurveChart';
 //   35665129473  MI355X SGLang  2026-09-22
 //   35693365964  MI355X ATOM    2026-09-22
 //
-// Plus one local sweep that is not in the InferenceX API:
-//   hungry-hippo-fin-03-4  B200 SGLang  2026-09-23  lmsysorg/sglang:v0.5.20-cu130
+// Plus two local sweeps that are not in the InferenceX API:
+//   hungry-hippo-fin-03-4   B200 SGLang    2026-09-23  lmsysorg/sglang:v0.5.20-cu130
+//   smci355-ccs-aus-m12-17  MI355X SGLang  2026-09-23  sglang local/glm52-prs-0923
+//
+// Line names follow MM-DD-<CI|local>-<name>, matching what InferenceX sync
+// produces, so that curves from different dates read and sort as a history.
 export const exampleSeries: InferenceCurveSeries[] = [
   {
     id: 'glm52-agentic-fp4-b200-sglang-tp8ep1',
-    name: 'B200 SGLang TP8/EP1',
+    name: '09-02-CI-B200 SGLang TP8/EP1',
     hwKey: 'b200_sglang',
     model: 'GLM-5.2',
     islOsl: 'Agentic Traces',
@@ -143,7 +147,7 @@ export const exampleSeries: InferenceCurveSeries[] = [
   },
   {
     id: 'glm52-agentic-fp4-mi355x-sglang-tp8ep1',
-    name: 'MI355X SGLang TP8/EP1',
+    name: '09-22-CI-MI355X SGLang TP8/EP1',
     hwKey: 'mi355x_sglang',
     model: 'GLM-5.2',
     islOsl: 'Agentic Traces',
@@ -229,7 +233,7 @@ export const exampleSeries: InferenceCurveSeries[] = [
   },
   {
     id: 'glm52-agentic-fp4-mi355x-sglang-tp4ep4',
-    name: 'MI355X SGLang TP4/EP4',
+    name: '09-22-CI-MI355X SGLang TP4/EP4',
     hwKey: 'mi355x_sglang',
     model: 'GLM-5.2',
     islOsl: 'Agentic Traces',
@@ -384,7 +388,7 @@ export const exampleSeries: InferenceCurveSeries[] = [
   },
   {
     id: 'glm52-agentic-fp4-mi355x-atom-tp8ep1',
-    name: 'MI355X ATOM TP8/EP1',
+    name: '09-22-CI-MI355X ATOM TP8/EP1',
     hwKey: 'mi355x_atom',
     model: 'GLM-5.2',
     islOsl: 'Agentic Traces',
@@ -470,7 +474,7 @@ export const exampleSeries: InferenceCurveSeries[] = [
   },
   {
     id: 'glm52-agentic-fp4-mi355x-atom-tp4ep1',
-    name: 'MI355X ATOM TP4/EP1',
+    name: '09-22-CI-MI355X ATOM TP4/EP1',
     hwKey: 'mi355x_atom',
     model: 'GLM-5.2',
     islOsl: 'Agentic Traces',
@@ -694,7 +698,7 @@ export const exampleSeries: InferenceCurveSeries[] = [
   },
   {
     id: 'glm52-agentic-fp4-b200-sglang-tp8ep1-v0520',
-    name: 'B200 SGLang TP8/EP1 (v0.5.20)',
+    name: '09-23-local-B200 SGLang TP8/EP1 (v0.5.20)',
     hwKey: 'b200_sglang_v0520',
     model: 'GLM-5.2',
     islOsl: 'Agentic Traces',
@@ -826,7 +830,7 @@ export const exampleSeries: InferenceCurveSeries[] = [
   },
   {
     id: 'glm52-agentic-fp4-mi355x-sglang-tp8ep1-prs0923',
-    name: '0924-MI355X SGLang-withPRs',
+    name: '09-23-local-MI355X SGLang-withPRs',
     hwKey: 'mi355x_sglang_prs0923',
     model: 'GLM-5.2',
     islOsl: 'Agentic Traces',

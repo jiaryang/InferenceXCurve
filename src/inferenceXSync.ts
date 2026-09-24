@@ -689,7 +689,10 @@ function benchmarkRecordsToSeries(
   const mtp = normalizeSpecMethod(config.specMethod) === MTP_SPEC ? 'mtp' : 'non-mtp';
   return {
     id: makeInferenceXSyncLineId(config),
-    name: lineName,
+    // Dating the name is what makes refreshes comparable: each sync rebuilds the
+    // name from its own benchmark date, so an archived copy keeps the old date
+    // and sits next to the new line instead of being indistinguishable from it.
+    name: prefixCurveName(latestPointDateFromPoints(points), 'CI', lineName),
     hwKey: makeHwKey(config),
     model,
     islOsl,
@@ -844,8 +847,13 @@ function makeSummaryItem(
   };
 }
 
-function latestPointDate(line: InferenceCurveSeries): string {
-  return line.points
+/** Benchmark date carried in the point labels, newest first, or '' if absent. */
+export function latestPointDate(line: InferenceCurveSeries): string {
+  return latestPointDateFromPoints(line.points);
+}
+
+function latestPointDateFromPoints(points: InferenceCurveSeries['points']): string {
+  return points
     .map((point) => {
       const label = String(point.label ?? '');
       return label.match(/\bcurve_date\s+(\d{4}-\d{2}-\d{2})\b/u)?.[1] ??
@@ -853,6 +861,17 @@ function latestPointDate(line: InferenceCurveSeries): string {
     })
     .filter(Boolean)
     .sort((a, b) => b.localeCompare(a))[0] ?? '';
+}
+
+/**
+ * Curve naming convention: `MM-DD-<source>-<name>`, so that lines sort and read
+ * by when the data was taken and where it came from. The date is dropped when
+ * the source data carries none.
+ */
+export function prefixCurveName(isoDate: string, source: 'CI' | 'local', name: string): string {
+  const parts = /^\d{4}-(\d{2})-(\d{2})$/u.exec(isoDate);
+  const prefix = parts ? `${parts[1]}-${parts[2]}-${source}` : source;
+  return `${prefix}-${name}`;
 }
 
 function normalizeSpecMethod(value: string | undefined): string {

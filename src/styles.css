@@ -1833,6 +1833,26 @@ p {
   gap: 6px;
 }
 
+.inferencex-sync-keep {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  color: var(--muted-foreground);
+  cursor: pointer;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.inferencex-sync-keep:hover {
+  color: var(--foreground);
+}
+
+.inferencex-sync-keep input {
+  margin: 0;
+  cursor: pointer;
+}
+
 .inferencex-sync-status-row {
   display: grid;
   gap: 2px;
