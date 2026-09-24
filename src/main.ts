@@ -5702,8 +5702,27 @@ function saveActiveSeriesForCurrentView(): void {
   state.knownSeriesIdsByView.set(key, new Set(visibleIds));
 }
 
+// Curves a view starts with. The bundled dataset carries several generations
+// of the same hardware, and showing all of them at once buries the comparison
+// they exist for: newest CI run for B200 and for MI355X SGLang, plus the
+// newest local MI355X sweep. Matching on hwKey rather than id keeps this
+// working under Merge Parallelism, where a merged curve inherits the hwKey but
+// gets a derived id.
+const DEFAULT_VISIBLE_HW_KEYS = new Set([
+  'b200_sglang',
+  'mi355x_sglang',
+  'mi355x_sglang_prs0923'
+]);
+
+/** Falls back to everything, so imported datasets are not hidden by this. */
+function pickDefaultVisibleSeries(series: InferenceCurveSeries[]): InferenceCurveSeries[] {
+  const preferred = series.filter((line) => DEFAULT_VISIBLE_HW_KEYS.has(line.hwKey ?? ''));
+  return preferred.length > 0 ? preferred : series;
+}
+
 function restoreActiveSeriesForCurrentView(): void {
-  const visibleIds = getCurrentViewSeriesIds();
+  const visible = getFilteredSeriesForChart();
+  const visibleIds = new Set(visible.map((line) => line.id));
   if (visibleIds.size === 0) {
     state.activeSeriesIds = new Set();
     return;
@@ -5721,16 +5740,22 @@ function restoreActiveSeriesForCurrentView(): void {
       ...Array.from(savedIds).filter((id) => visibleIds.has(id)),
       ...Array.from(visibleIds).filter((id) => !known.has(id))
     ]);
-    // A saved view whose ids have all gone stale (reload drops merged ids,
-    // which are derived rather than persisted) must not leave an empty chart.
+    // A saved view whose ids have all gone stale must not leave an empty chart.
     if (restored.size > 0) {
       state.activeSeriesIds = restored;
       return;
     }
+    const carried = Array.from(state.activeSeriesIds).filter((id) => visibleIds.has(id));
+    if (carried.length > 0) {
+      state.activeSeriesIds = new Set(carried);
+      return;
+    }
   }
 
-  const currentIds = Array.from(state.activeSeriesIds).filter((id) => visibleIds.has(id));
-  state.activeSeriesIds = currentIds.length ? new Set(currentIds) : visibleIds;
+  // A view opened for the first time starts at the default set. Carrying the
+  // previous selection over by id cannot work here anyway: Merge Parallelism
+  // gives a merged curve a derived id, so intersecting would quietly drop it.
+  state.activeSeriesIds = new Set(pickDefaultVisibleSeries(visible).map((line) => line.id));
 }
 
 function reconcileActiveSeriesForChart(): void {
@@ -5807,7 +5832,7 @@ function createInitialState(series: InferenceCurveSeries[]): AppState {
     tcoCostMode: 'hyperscaler',
     tcoCustomCosts: {},
     latencyPercentile: DEFAULT_LATENCY_PERCENTILE,
-    activeSeriesIds: new Set(visibleSeries.map((line) => line.id)),
+    activeSeriesIds: new Set(pickDefaultVisibleSeries(visibleSeries).map((line) => line.id)),
     activeSeriesIdsByView: new Map(),
     knownSeriesIdsByView: new Map(),
     selectedPrecisions: firstPrecisionSelection(visibleSeries),
@@ -5824,7 +5849,7 @@ function createInitialState(series: InferenceCurveSeries[]): AppState {
     showConcurrencyLabels: false,
     useAdvancedLabels: false,
     showGradientLabels: false,
-    showLineLabels: false,
+    showLineLabels: true,
     lineLabelOffsets: {},
     showGoalDirection: true,
     showOffloadRings: true,
