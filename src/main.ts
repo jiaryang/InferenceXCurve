@@ -351,18 +351,16 @@ const MAX_SNAPSHOTS = 20;
 const MAX_SNAPSHOT_NAME_LENGTH = 60;
 // Past versions of a synced line to keep before the oldest is dropped.
 const MAX_SYNC_ARCHIVES = 5;
-// Curves a view starts with. The bundled dataset carries several generations
-// of the same hardware, and showing all of them at once buries the comparison
-// they exist for: newest CI run for B200 and for MI355X SGLang, plus the
-// newest local MI355X sweep. Matching on hwKey rather than id keeps this
-// working under Merge Parallelism, where a merged curve inherits the hwKey but
-// gets a derived id. Declared up here because createInitialDataState reads it
-// during module init, long before the code that uses it further down.
-const DEFAULT_VISIBLE_HW_KEYS = new Set([
-  'b200_sglang',
-  'mi355x_sglang',
-  'mi355x_sglang_prs0923'
-]);
+// Curves a view starts with: the newest SGLang run of each of these, read off
+// the `MM-DD-<CI|local>-<hardware> SGLang` name prefix so that a newer run
+// takes over by itself. Everything else (local B200, ATOM, older runs) stays in
+// the legend to be switched on by hand. Names rather than ids, because Merge
+// Parallelism gives a merged curve a derived id but keeps the shared name.
+// Declared up here, like the two below, because createInitialDataState reads
+// them during module init, long before the code that uses them further down.
+const DEFAULT_VISIBLE_RUNS = new Set(['CI|B200', 'CI|MI355X', 'local|MI355X']);
+const DEFAULT_RUN_NAME = /^(\d{2}-\d{2})-(CI|local)-(B200|MI355X)\s+SGLang\b/u;
+const SYNC_ARCHIVE_SEPARATOR = '::archived-';
 // A trailing parallelism token such as `TP8/EP1`, `TEP4` or `DPA8`. Used only as
 // a fallback for series that carry no hardware key, so the grouping still works
 // on imported data while lines without such a token stay on their own. Up here
@@ -2856,8 +2854,6 @@ function applyInferenceXSyncResult(result: InferenceXSyncResult, options: { init
     );
   }
 }
-
-const SYNC_ARCHIVE_SEPARATOR = '::archived-';
 
 /**
  * Keeps the outgoing version of every line the refresh actually changed, so a
@@ -5721,7 +5717,22 @@ function saveActiveSeriesForCurrentView(): void {
 
 /** Falls back to everything, so imported datasets are not hidden by this. */
 function pickDefaultVisibleSeries(series: InferenceCurveSeries[]): InferenceCurveSeries[] {
-  const preferred = series.filter((line) => DEFAULT_VISIBLE_HW_KEYS.has(line.hwKey ?? ''));
+  const candidates = series.flatMap((line) => {
+    // A merged archive's id is derived, but it inherits the archive's hwKey.
+    if (line.id.includes(SYNC_ARCHIVE_SEPARATOR) || line.hwKey?.includes(SYNC_ARCHIVE_SEPARATOR)) return [];
+    const match = DEFAULT_RUN_NAME.exec(line.name ?? '');
+    if (!match) return [];
+    const run = `${match[2]}|${match[3]}`;
+    return DEFAULT_VISIBLE_RUNS.has(run) ? [{ line, run, date: match[1]! }] : [];
+  });
+
+  const newest = new Map<string, string>();
+  candidates.forEach(({ run, date }) => {
+    if (date > (newest.get(run) ?? '')) newest.set(run, date);
+  });
+  // Every parallelism config of the newest run, so Merge Parallelism off shows
+  // TP8 and TP4 alike rather than an arbitrary one of them.
+  const preferred = candidates.filter(({ run, date }) => newest.get(run) === date).map(({ line }) => line);
   return preferred.length > 0 ? preferred : series;
 }
 
