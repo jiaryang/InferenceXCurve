@@ -5840,6 +5840,10 @@ function createInitialState(series: InferenceCurveSeries[]): AppState {
     ? ALL_VALUE
     : getAvailableMtpFilters(sequenceFiltered)[0] ?? ALL_VALUE;
   const visibleSeries = filterSeriesByMtp(sequenceFiltered, mtpFilter);
+  // Merge Parallelism starts on, and a merged curve's id is derived. Picking the
+  // defaults from the unmerged lines would select ids the chart never shows.
+  const mergeParallelism = true;
+  const chartSeries = mergeParallelism ? mergeSeriesByParallelism(visibleSeries) : visibleSeries;
 
   return {
     theme: getTheme(),
@@ -5848,7 +5852,7 @@ function createInitialState(series: InferenceCurveSeries[]): AppState {
     tcoCostMode: 'hyperscaler',
     tcoCustomCosts: {},
     latencyPercentile: DEFAULT_LATENCY_PERCENTILE,
-    activeSeriesIds: new Set(pickDefaultVisibleSeries(visibleSeries).map((line) => line.id)),
+    activeSeriesIds: new Set(pickDefaultVisibleSeries(chartSeries).map((line) => line.id)),
     activeSeriesIdsByView: new Map(),
     knownSeriesIdsByView: new Map(),
     selectedPrecisions: firstPrecisionSelection(visibleSeries),
@@ -5858,7 +5862,7 @@ function createInitialState(series: InferenceCurveSeries[]): AppState {
     mtpFilter,
     // Matches the published InferenceX chart, which keys a curve on hardware and
     // framework and leaves parallelism as a point label.
-    mergeParallelism: true,
+    mergeParallelism,
     enforceEndToEndPareto: false,
     showNonOptimalPoints: false,
     hidePointLabels: true,
